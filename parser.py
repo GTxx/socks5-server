@@ -200,7 +200,10 @@ class Packer:
             self.data += struct.pack("!{}{}".format(num, field.format), data)
         elif len(field_data) == 3:
             num, field, data = field_data
-            self.data += struct.pack("!{}{}".format(num, field.format), *data)
+            if field in (String, ):
+                self.data += struct.pack("!{}{}".format(num, field.format), data)
+            else:
+                self.data += struct.pack("!{}{}".format(num, field.format), *data)
 
 
 if __name__ == "__main__":

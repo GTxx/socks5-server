@@ -14,10 +14,9 @@ logging.getLogger(__name__).addHandler(NullHandler())
 logger = logging.getLogger()
 handler = logging.StreamHandler()
 formatter = logging.Formatter(
-        '%(asctime)s %(name) -3s %(funcName)s %(lineno)d -12s %(levelname)-8s %(message)s')
+        '%(asctime)s %(name) -3s %(funcName)s %(lineno)d %(levelname)-8s %(message)s')
 handler.setFormatter(formatter)
 logger.addHandler(handler)
-logger.setLevel(logging.DEBUG)
 
 
 CMD_CONNECT = 1
@@ -29,25 +28,59 @@ SERVER_HOST = None
 SERVER_PORT = None
 
 
-async def copy(source, dest):
+async def upstream_copy(local_sock, remote_sock):
     while True:
-        data = await source.recv(1000)
+        try:
+            data = await local_sock.recv(1000)
+        except ConnectionResetError as e:
+            logger.debug("local_sock: {} is broken for: {}".format(local_sock, e))
+            await remote_sock.shutdown(cr_socket.SHUT_RDWR)
+            return
+
         if not data:
-            break
-        await dest.sendall(data)
+            try:
+                await remote_sock.shutdown(cr_socket.SHUT_RDWR)
+            except OSError as e:
+                # if ConnectionResetError occur for remote_sock, remote_sock is
+                # already not connected,
+                logger.debug("shutdown remote_sock fail, e: {}".format(e))
+            return
+        else:
+            await remote_sock.sendall(data)
+
+
+async def downstream_copy(local_sock, remote_sock):
+    while True:
+        try:
+            data = await remote_sock.recv(1000)
+        except ConnectionResetError as e:
+            logger.debug("remote_sock: {} is broken for: {}".format(remote_sock, e))
+            await local_sock.shutdown(cr_socket.SHUT_RDWR)
+            return
+
+        if not data:
+            try:
+                await local_sock.shutdown(cr_socket.SHUT_RDWR)
+            except OSError as e:
+                logger.debug("shutdown local_sock fail, e: {}".format(e))
+            return
+        else:
+            await local_sock.sendall(data)
 
 
 async def bidirection_copy(source, dest):
-    task1 = await curio.spawn(copy(source, dest))
-    task2 = await curio.spawn(copy(dest, source))
+    task1 = await curio.spawn(upstream_copy(source, dest))
+    task2 = await curio.spawn(downstream_copy(source, dest))
     try:
-        await task1.join()
-        await task2.join()
+        async for task in curio.wait([task1, task2]):
+            await task.join()
+    except curio.TaskCancelled:
+        pass # fail silently if curio is shutdown
     except Exception as e:
-        logger.debug("exception during tcp proxy: {}".format(e))
+        logger.debug("tcp proxy error: {}, source: {}, dest: {}".format(e, source, dest))
     finally:
-        await task1.cancel(False)
-        await task2.cancel(False)
+        await task1.cancel()
+        await task2.cancel()
 
 
 async def socks5_handler(client: cr_socket, addr):
@@ -77,9 +110,15 @@ async def socks5_handler(client: cr_socket, addr):
         await client.sendall(connect_reply_data)
 
         # transfer
-        tcp_sock = await curio.open_connection(addr, port)
-        async with tcp_sock:
-            await bidirection_copy(client, tcp_sock)
+        async with client:
+            try:
+                tcp_sock = await curio.open_connection(addr, port)
+            except Exception as e:
+                logger.debug("tcp fail to connect addr: {} port{}, error: {}".format(addr, port, e))
+                return
+
+            async with tcp_sock:
+                await bidirection_copy(client, tcp_sock)
 
     elif cmd == CMD_UDP_ASSOCIATE:
         connect_reply_data = pack_udp_associate_reply(SERVER_HOST, SERVER_PORT)
@@ -124,13 +163,17 @@ async def socks5_server(host, port):
 @click.command()
 @click.option('--host', default="127.0.0.1", help='socks5 server address.')
 @click.option('--port', default=1082, help='socks5 server port.')
-def start(host, port):
+@click.option('--monitor', default=False, help="turn on curio monitor")
+@click.option('--debug_log', default=False, help="turn on debug log")
+def start(host, port, monitor, debug_log):
     global SERVER_HOST
     global SERVER_PORT
     SERVER_HOST = host
     SERVER_PORT = port
+    if debug_log:
+        logger.setLevel(logging.DEBUG)
     click.echo("socks5 server started!")
-    curio.run(socks5_server(host, port))
+    curio.run(socks5_server(host, port), with_monitor=monitor)
 
 
 if __name__ == '__main__':
